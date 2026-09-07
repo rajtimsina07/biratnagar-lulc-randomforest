@@ -1139,3 +1139,195 @@ var aoi =
               "Class": 6,
               "system:index": "21"
             })]);
+
+//Workflow 1
+var imagery = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                  .filterDate('2023-01-01','2023-12-30')
+                  //pre filter to get less cloudy granules
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE',20))
+                  .filterBounds(aoi)
+                  .map(mask2clouds)
+                  .map(function(img) {return img.clip(aoi);})
+                  .median();
+imagery = selectBands(imagery);
+print(imagery);
+Map.addLayer(imagery,imageVisParam,'dataset_rgbviz',true);
+
+function mask2clouds(image){
+  var qa =image.select('QA60');
+  //Bits 10 and 11 are clouds and cirrus
+  var cloudBitMask =1<<10;
+  var cirrusBitMask = 1<<11;
+  //both flags should be set to zero
+  var mask=qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000); //integers to floating-point values representing actual reflectance (scaled between 0 and 1).
+}
+//select bands ,calculate NDVI
+function selectBands(image){
+  var ndvi =image.expression(
+  '(NIR-RED)/(NIR+RED)',{
+    'NIR':image.select('B8'),
+    'RED':image.select('B4')
+}).rename('NDVI');
+  var bands = ['B4','B3','B2','B8','B11','B12'];
+  image = image.select(bands);
+//add NDVI to image
+image=image.addBands(ee.Image([ndvi]));
+return image;
+}
+//visualize Imagery
+Map.centerObject(aoi);
+//machine learning models
+var sample= water.merge(vegetation).merge(builtup).merge(Agriculture).merge(sand).merge(Roads).randomColumn();
+//split train and test
+var train = sample.filter(ee.Filter.lte('random',0.8));
+var test = sample.filter(ee.Filter.gt('random',0.8));
+//extract image values
+var trainSample = imagery.sampleRegions({
+  collection:train,
+  scale:10,
+  properties:['Class']
+});
+var testSample = imagery.sampleRegions({
+  collection:test,
+  scale:10,
+  properties:['Class']
+});
+var legend = {
+  'LULC_Class_Values':[1,2,3,4,5,6],
+  //lulc class palette
+  'lulc_class_palette':['Forestgreen','dodgerblue','red','olivedrab','khaki','darkgray']
+};
+
+//train RandomForest Model
+var rf_model = ee.Classifier.smileRandomForest(50).train({
+    features:trainSample,
+    classProperty:'Class',
+    inputProperties: imagery.bandNames()});
+
+//accuracy test
+var cm = testSample.classify(rf_model, 'predict').errorMatrix('Class','predict');
+print('confusion matrix', cm, 'accuracy',cm.accuracy(),'Kappa',cm.kappa());
+var lulc = imagery.classify(rf_model,'LULC').toByte().set(legend);
+Map.addLayer(lulc,{min:1, max:6, palette:legend.lulc_class_palette},'LULC Map',true);
+//set legend
+var legendPanel = ui.Panel({
+  style:{
+    position:'bottom-left',
+    padding:'8px 15px',
+  },
+});
+//create legend title
+var legendTitle = ui.Label({
+  value:'LULC Legend',
+  style:{
+    fontWeight: 'bold',
+    fontSize: '18px',
+    margin: '0 0 4px 0',
+    padding: '0',
+  },
+});
+//add the title to the panel
+legendPanel.add(legendTitle);
+//create and style one row of the legend
+var makeRow = function(color,name){
+  //create the label that is actually the label box
+  var colorBox = ui.Label({
+    style:{
+      backgroundColor:color,
+      //use padding to give height and width
+      padding:'8px',
+      margin: '0 0 4px 0',
+    },
+  });
+  
+
+ // Create the label filled with the description text.
+  var description = ui.Label({
+    value: name,
+    style: { margin: "0 0 4px 6px" },
+  });
+
+  // return the panel
+  return ui.Panel({
+    widgets: [colorBox, description],
+    layout: ui.Panel.Layout.Flow("horizontal"),
+  });
+};
+
+//  Palette with the colors
+var palette = [
+  'forestgreen', // 1. Vegetation (Deep, natural green)
+    'dodgerblue',  // 2. Water (Vivid, recognizable blue)
+    'red',         // 3. Builtup (Standard urban/infrastructure red)
+    'olivedrab',   // 4. Agriculture (Yellowish-green for crops/fields)
+    'khaki',       // 5. Sands (Light tan/desert sand color)
+    'darkgray'     // 6. Roads (Slate/asphalt gray)
+  ];
+
+// name of the legend
+var names = [
+  "Vegetation",
+  "Water",
+  "Builtup",
+  "Agriculture",
+  "sand",
+  "Roads",
+  ];
+
+// Add color and and names
+for (var i = 0; i < names.length; i++) {
+  legendPanel.add(makeRow(palette[i], names[i]));
+}
+
+// add legend to map (alternatively you can also print the legend to the console)
+Map.add(legendPanel);
+Map.setOptions('HYBRID');
+
+//// WORKFLOW 2: Probability Hillshade Map
+//Create a Probability Hillshade Visualization
+var rf_prob_model = ee.Classifier.smileRandomForest(50)
+    .setOutputMode('MULTIPROBABILITY')
+    .train({
+      features:trainSample,
+      classProperty:'Class',
+      inputProperties:imagery.bandNames()
+    });
+
+var probImageArray = imagery.classify(rf_prob_model);
+//Convert the single array band into independent flat bands
+var probImageFlat = probImageArray.arrayFlatten([['classification_0', 'classification_1', 'classification_2', 'classification_3', 'classification_4', 'classification_5']]);
+var projection = ee.Projection('EPSG:3857').atScale(10);
+var projectedProbabilities = probImageFlat.setDefaultProjection(projection);
+
+//create Image with the highest probability
+var top1Probability = projectedProbabilities.reduce(ee.Reducer.max());
+//convert the prob values to Integer
+var top1Confidence = top1Probability.multiply(100).int();
+//compute the hillshade
+var hillshade =ee.Terrain.hillshade(top1Confidence).divide(255);
+//colorize the categorical lulc map
+var colorizedlulc = lulc.visualize({
+  min:1,
+  max:6,
+  palette:[
+    'forestgreen', // 1. Vegetation (Deep, natural green)
+    'dodgerblue',  // 2. Water (Vivid, recognizable blue)
+    'red',         // 3. Builtup (Standard urban/infrastructure red)
+    'olivedrab',   // 4. Agriculture (Yellowish-green for crops/fields)
+    'khaki',       // 5. Sands (Light tan/desert sand color)
+    'darkgray'  
+    ]
+});
+//Extract separate Red, Green, and Blue bands from the colorization
+var r=colorizedlulc.select('vis-red');
+var g =colorizedlulc.select('vis-green');
+var b= colorizedlulc.select('vis-blue');
+//// 3. Multiply each standalone color channel by the gray hillshade layer
+var rshaded = r.multiply(hillshade);
+var gshaded = g.multiply(hillshade);
+var bshaded = b.multiply(hillshade);
+var probabilityHillshade  = ee.Image.cat([rshaded,gshaded,bshaded]).rename(['red','green','blue']);
+var hillshadeVisParams = {min:0, max:255};
+Map.addLayer(probabilityHillshade, hillshadeVisParams,'Probability Hillshade',true);
